@@ -52,25 +52,77 @@ Total pages: 0 / Indexed: 0 / Pending: 0
 
 Two chained incompatibilities:
 
-1. **`getSitemapsFromConfig` always returns `[]`** — `nuxt-ai-ready` reads
-   `runtimeConfig.sitemap.sitemaps` to detect multi-sitemap mode, but `@nuxtjs/sitemap`
-   stores its config in a Nitro virtual module (`#sitemap-virtual/static-config.mjs`),
-   not in `runtimeConfig`. Only `{ cacheMaxAgeSeconds, debug }` ends up in
-   `runtimeConfig.sitemap`, so multi-sitemap mode never activates.
+### 1. `getSitemapsFromConfig` always returns `[]`
 
-2. **`/sitemap.xml` redirects (307) instead of serving XML** — when `@nuxtjs/i18n` is
-   active, `@nuxtjs/sitemap` always creates per-locale sitemaps regardless of whether
-   named `sitemaps` or a single `sources` config is used. This sets `isMultiSitemap = true`
-   and adds a Nitro route rule `{ "/sitemap.xml": { redirect: "/sitemap_index.xml" } }`.
-   `nuxt-ai-ready`'s internal `event.$fetch('/sitemap.xml')` either does not follow the
-   307 in Nitro's internal fetch context, or `isSitemapIndex` fails on the response.
+`nuxt-ai-ready` `runtime/server/utils/sitemap.js:7-23` reads
+`runtimeConfig.sitemap.sitemaps` to detect multi-sitemap mode:
+
+```js
+export function getSitemapsFromConfig(event) {
+  const runtimeConfig = useRuntimeConfig(event);
+  const sitemapConfig = runtimeConfig.sitemap;
+  if (!sitemapConfig?.sitemaps)  // always true
+    return [];
+```
+
+However `@nuxtjs/sitemap` `module.mjs:1077-1085` deliberately splits its config:
+
+```js
+const dynamicRuntimeConfig = {
+  cacheMaxAgeSeconds: runtimeConfig.cacheMaxAgeSeconds,
+  debug: runtimeConfig.debug,
+  // sitemaps intentionally excluded
+};
+nuxt.options.runtimeConfig.sitemap = dynamicRuntimeConfig;              // line 1082
+nitroConfig.virtual["#sitemap-virtual/static-config.mjs"] =
+  `export default ${JSON.stringify(staticRuntimeConfig)}`;              // line 1085
+```
+
+The full config (including `sitemaps`) goes into the virtual module. Only
+`{ cacheMaxAgeSeconds, debug }` ends up in `runtimeConfig.sitemap`, so
+`getSitemapsFromConfig()` always returns `[]` and multi-sitemap mode never activates.
+
+### 2. `event.$fetch('/sitemap.xml')` returns HTML, not XML
+
+When `@nuxtjs/i18n` is active, `@nuxtjs/sitemap` `module.mjs:750-751` registers a Nitro
+route rule regardless of whether you use named `sitemaps` or a flat `sources` config:
+
+```js
+if (usingMultiSitemaps) {
+  nuxt.options.nitro.routeRules["/sitemap.xml"] = { redirect: "/sitemap_index.xml" };
+```
+
+Since root cause #1 fires first, `nuxt-ai-ready` falls to single-sitemap mode and calls
+`event.$fetch('/sitemap.xml', { responseType: "text" })` (`sitemap.js:55`). Nitro's
+internal `event.$fetch` resolves route rules without going through the HTTP stack. When it
+hits the redirect rule, it returns the HTML redirect response body rather than following
+the 307 to `/sitemap_index.xml`. As a result, `isSitemapIndex(sitemapXml)` at `sitemap.js:71`
+returns `false` (the content is HTML, not sitemap XML), and `parseSitemapXml` throws:
+
+```
+XML does not contain a valid urlset element
+```
+
+Note: `fetchSitemapByRoute` already handles the sitemapindex XML format correctly
+(`sitemap.js:71-101`) — if it ever received actual XML from `/sitemap_index.xml`, it
+would recursively fetch all locale child sitemaps. The redirect simply prevents that.
 
 ## Suggested fix
 
-Either:
+Two independent options, either of which would resolve the issue:
 
-- Have `nuxt-ai-ready` read the sitemaps config from the virtual module
-  (`#sitemap-virtual/static-config.mjs`) instead of `runtimeConfig`, enabling it to fetch
-  locale sitemaps directly without going through `/sitemap.xml`.
-- Or follow the redirect chain `/sitemap.xml` → `/sitemap_index.xml` → locale children
-  and handle the sitemapindex XML format correctly.
+**Option A** — in `getSitemapsFromConfig` (`sitemap.js:7-23`), import
+`#sitemap-virtual/static-config.mjs` instead of reading `runtimeConfig.sitemap`. This
+gives access to the full config including `sitemaps`, enabling multi-sitemap mode and
+bypassing the `/sitemap.xml` redirect entirely.
+
+**Option B** — in `module.mjs:756-757`, `nuxt-ai-ready` already reads the route rule at
+build time:
+
+```js
+const sitemapRouteRule = nuxt.options.nitro?.routeRules?.["/sitemap.xml"];
+```
+
+It currently only checks `sitemapRouteRule?.prerender`. It could also check
+`sitemapRouteRule?.redirect`: if a redirect target exists, store it in `runtimeConfig` so
+that `fetchSitemapUrls` fetches the redirect target directly instead of `/sitemap.xml`.
